@@ -1,0 +1,24 @@
+version: "3.9"
+
+services:
+  bot:
+    build: .
+    container_name: tele_unsplash_bot
+    env_file:
+      - .env
+    volumes:
+      - ./buffer_images:/app/buffer_images
+      - ./logs:/app/logs
+    depends_on:
+      - redis
+
+  redis:
+    image: redis:alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+volumes:
+  redis_data:

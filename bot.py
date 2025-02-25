@@ -17,16 +17,18 @@ import database
 from utils.logger import setup_logger
 import httpx
 import asyncio
+from redis_client import get_cached_search_results, cache_search_results, cache_gallery_state
+from buffer_manager import get_buffered_image, cleanup_buffer
 
-# Состояния для диалога поиска и настроек
+# Состояния для диалога и галереи
 SEARCH = 1
 GALLERY_SEARCH = 2
 GALLERY_NAV = 3
 SETTINGS_MAIN, SET_ORIENTATION, SET_COLOR, SET_ORDER = range(10, 14)
 
 # Глобальные переменные
-LAST_PHOTO = {}  # для скачивания случайных/одиночных фото
-RANDOM_CACHE = []  # буфер предзагруженных случайных фото
+LAST_PHOTO = {}         # для скачивания одиночных фото
+RANDOM_CACHE = []       # буфер предзагруженных случайных фото
 BUFFER_SIZE = 5
 
 # Дефолтные настройки
@@ -81,7 +83,7 @@ def settings_menu_keyboard(current_settings: dict) -> InlineKeyboardMarkup:
     ]
     return InlineKeyboardMarkup(keyboard)
 
-# ----- Основное меню -----
+# ----- Главное меню -----
 def create_main_menu(is_subscribed: bool = False) -> InlineKeyboardMarkup:
     subscribe_text = "Отписаться" if is_subscribed else "Подписаться"
     keyboard = [
@@ -112,7 +114,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Команды:\n/start, /help, /subscribe, /unsubscribe, /settings, /gallery"
     )
 
-# ----- Случайное фото с фильтрами и буфером -----
+# ----- Случайное фото -----
 async def random_photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -123,12 +125,10 @@ async def random_photo_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         extra_params["orientation"] = settings["orientation"]
     if settings.get("color", "any") != "any":
         extra_params["color"] = settings["color"]
-    # Если в буфере есть фото, используем их
     if RANDOM_CACHE:
         photo = RANDOM_CACHE.pop(0)
     else:
         photo = await get_random_photo(**extra_params)
-    # Запускаем предзагрузку, если буфер ниже порога
     if len(RANDOM_CACHE) < BUFFER_SIZE:
         context.application.create_task(preload_random_photo(extra_params))
     if photo:
@@ -170,17 +170,6 @@ async def download_photo_handler(update: Update, context: ContextTypes.DEFAULT_T
         logger.error(f"Ошибка при скачивании фото: {e}")
         await query.message.reply_text("Ошибка при скачивании фото.")
 
-async def prompt_search_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    await query.message.reply_text("Введите поисковый запрос:")
-    return SEARCH
-
-async def search_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Здесь можно оставить одиночный поиск как ранее (или объединить с галереей)
-    await update.message.reply_text("Для галереи используйте команду /gallery")
-    return ConversationHandler.END
-
 async def back_to_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -202,7 +191,7 @@ async def toggle_subscription_handler(update: Update, context: ContextTypes.DEFA
     is_subscribed = database.check_subscription(user.id)
     await query.message.reply_text("Главное меню:", reply_markup=create_main_menu(is_subscribed))
 
-# ----- Галерея (мульти-миниатюры с пагинацией) -----
+# ----- Галерея с кэшированием и буфером -----
 async def gallery_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Введите поисковый запрос для галереи:")
     return GALLERY_SEARCH
@@ -218,16 +207,25 @@ async def gallery_search_handler(update: Update, context: ContextTypes.DEFAULT_T
         extra_params["color"] = settings["color"]
     if settings.get("order_by", "relevant"):
         extra_params["order_by"] = settings["order_by"]
-    # По умолчанию 10 фото на страницу
-    results = await search_photos(query_text, page=1, per_page=10, **extra_params)
+    page = 1
+    cached = await get_cached_search_results(query_text, settings, page)
+    if cached:
+        results = cached
+    else:
+        results = await search_photos(query_text, page=page, per_page=10, **extra_params)
+        if results and results.get("results"):
+            await cache_search_results(query_text, settings, page, results)
     if results and results.get("results"):
+        state = {"query": query_text, "page": page, "total_pages": results.get("total_pages", 1)}
+        await cache_gallery_state(user_id, state)
         context.user_data["gallery_query"] = query_text
-        context.user_data["gallery_page"] = 1
+        context.user_data["gallery_page"] = page
         context.user_data["gallery_total_pages"] = results.get("total_pages", 1)
         context.user_data["gallery_results"] = results
         await send_gallery(update.effective_chat.id, context)
     else:
         await update.message.reply_text("Ничего не найдено.")
+        return ConversationHandler.END
     return GALLERY_NAV
 
 async def send_gallery(chat_id, context: ContextTypes.DEFAULT_TYPE):
@@ -235,15 +233,16 @@ async def send_gallery(chat_id, context: ContextTypes.DEFAULT_TYPE):
     if not results:
         return
     media = []
+    # Для каждой фотографии скачиваем миниатюру в буфер
     for photo in results.get("results", []):
-        # Используем миниатюру (small) для экономии трафика
         thumb_url = photo.get("urls", {}).get("small")
         if thumb_url:
-            media.append(InputMediaPhoto(media=thumb_url))
-    # Отправляем альбом
+            local_path = await get_buffered_image(thumb_url)
+            if local_path:
+                media.append(InputMediaPhoto(media=local_path))
     if media:
         await context.bot.send_media_group(chat_id=chat_id, media=media)
-    # Формируем inline-клавиатуру для выбора фото и навигации
+    # Формируем клавиатуру для выбора и навигации
     buttons = []
     for i in range(len(results.get("results", []))):
         buttons.append(InlineKeyboardButton(f"{i+1}", callback_data=f"gallery_select:{i}"))
@@ -263,6 +262,7 @@ async def gallery_callback_handler(update: Update, context: ContextTypes.DEFAULT
     await query.answer()
     data = query.data
     user_id = query.from_user.id
+    settings = database.get_user_settings(user_id) or DEFAULT_SETTINGS
     if data.startswith("gallery_select:"):
         index = int(data.split(":")[1])
         results = context.user_data.get("gallery_results")
@@ -273,14 +273,13 @@ async def gallery_callback_handler(update: Update, context: ContextTypes.DEFAULT
             description = photo.get("description") or photo.get("alt_description") or "Без описания"
             caption = f"{description}\nАвтор: {photo.get('user', {}).get('name', 'Неизвестно')}"
             await query.message.reply_photo(photo=image_url, caption=caption)
-    elif data == "gallery_next" or data == "gallery_prev":
+    elif data in ("gallery_next", "gallery_prev"):
         current_page = context.user_data.get("gallery_page", 1)
         total = context.user_data.get("gallery_total_pages", 1)
         new_page = current_page + 1 if data == "gallery_next" else current_page - 1
         if new_page < 1 or new_page > total:
             return
         query_text = context.user_data.get("gallery_query")
-        settings = database.get_user_settings(user_id) or DEFAULT_SETTINGS
         extra_params = {}
         if settings.get("orientation", "any") != "any":
             extra_params["orientation"] = settings["orientation"]
@@ -288,7 +287,13 @@ async def gallery_callback_handler(update: Update, context: ContextTypes.DEFAULT
             extra_params["color"] = settings["color"]
         if settings.get("order_by", "relevant"):
             extra_params["order_by"] = settings["order_by"]
-        results = await search_photos(query_text, page=new_page, per_page=10, **extra_params)
+        cached = await get_cached_search_results(query_text, settings, new_page)
+        if cached:
+            results = cached
+        else:
+            results = await search_photos(query_text, page=new_page, per_page=10, **extra_params)
+            if results and results.get("results"):
+                await cache_search_results(query_text, settings, new_page, results)
         if results and results.get("results"):
             context.user_data["gallery_page"] = new_page
             context.user_data["gallery_results"] = results
@@ -354,6 +359,42 @@ async def settings_callback_handler(update: Update, context: ContextTypes.DEFAUL
 def settings_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return SETTINGS_MAIN
 
+# ----- Ежедневные уведомления -----
+async def daily_notification(context: ContextTypes.DEFAULT_TYPE):
+    subscriptions = database.get_all_subscriptions()
+    for user_id, chat_id in subscriptions:
+        photo = await get_random_photo()
+        if photo:
+            image_url = photo.get("urls", {}).get("regular")
+            description = photo.get("description") or photo.get("alt_description") or "Без описания"
+            caption = f"{description}\nАвтор: {photo.get('user', {}).get('name', 'Неизвестно')}"
+            try:
+                await context.bot.send_photo(chat_id=chat_id, photo=image_url, caption=caption)
+            except Exception as e:
+                logger.error(f"Ошибка отправки уведомления пользователю {user_id}: {e}")
+
+# ----- Подписка/отписка -----
+async def subscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    if not database.check_subscription(user.id):
+        database.add_subscription(user.id, chat_id)
+        await update.message.reply_text("Вы подписались на уведомления!")
+    else:
+        await update.message.reply_text("Вы уже подписаны.")
+    is_subscribed = database.check_subscription(user.id)
+    await update.message.reply_text("Главное меню:", reply_markup=create_main_menu(is_subscribed))
+
+async def unsubscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if database.check_subscription(user.id):
+        database.remove_subscription(user.id)
+        await update.message.reply_text("Вы отписались от уведомлений.")
+    else:
+        await update.message.reply_text("Вы не подписаны.")
+    is_subscribed = database.check_subscription(user.id)
+    await update.message.reply_text("Главное меню:", reply_markup=create_main_menu(is_subscribed))
+
 # ----- Основной запуск -----
 def main():
     database.init_db()
@@ -362,18 +403,21 @@ def main():
     # Командные обработчики
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("subscribe", lambda u, c: subscribe_command(u, c)))
-    application.add_handler(CommandHandler("unsubscribe", lambda u, c: unsubscribe_command(u, c)))
+    application.add_handler(CommandHandler("subscribe", subscribe_command))
+    application.add_handler(CommandHandler("unsubscribe", unsubscribe_command))
     application.add_handler(CommandHandler("settings", settings_command))
     application.add_handler(CommandHandler("gallery", gallery_command))
 
-    # Conversation для одиночного поиска (если потребуется)
-    conv_handler = ConversationHandler(
-        entry_points=[CallbackQueryHandler(prompt_search_handler, pattern="^prompt_search$")],
-        states={SEARCH: [MessageHandler(filters.TEXT & ~filters.COMMAND, search_query_handler)]},
+    # Conversation для галереи
+    gallery_conv = ConversationHandler(
+        entry_points=[CommandHandler("gallery", gallery_command)],
+        states={
+            GALLERY_SEARCH: [MessageHandler(filters.TEXT & ~filters.COMMAND, gallery_search_handler)],
+            GALLERY_NAV: [CallbackQueryHandler(gallery_callback_handler, pattern="^(gallery_select:.*|gallery_next|gallery_prev|back_to_menu)$")]
+        },
         fallbacks=[CommandHandler("cancel", lambda u, c: u.message.reply_text("Операция отменена.", reply_markup=create_main_menu()))]
     )
-    application.add_handler(conv_handler)
+    application.add_handler(gallery_conv)
 
     # Conversation для настроек
     settings_conv = ConversationHandler(
@@ -388,18 +432,7 @@ def main():
     )
     application.add_handler(settings_conv)
 
-    # Галерея
-    gallery_conv = ConversationHandler(
-        entry_points=[CommandHandler("gallery", gallery_command)],
-        states={
-            GALLERY_SEARCH: [MessageHandler(filters.TEXT & ~filters.COMMAND, gallery_search_handler)],
-            GALLERY_NAV: [CallbackQueryHandler(gallery_callback_handler, pattern="^(gallery_select:.*|gallery_next|gallery_prev|back_to_menu)$")]
-        },
-        fallbacks=[CommandHandler("cancel", lambda u, c: u.message.reply_text("Операция отменена.", reply_markup=create_main_menu()))]
-    )
-    application.add_handler(gallery_conv)
-
-    # Inline-обработчики
+    # Inline-обработчики для одиночных фото
     application.add_handler(CallbackQueryHandler(random_photo_handler, pattern="^random_photo$"))
     application.add_handler(CallbackQueryHandler(back_to_menu_handler, pattern="^back_to_menu$"))
     application.add_handler(CallbackQueryHandler(toggle_subscription_handler, pattern="^toggle_subscription$"))
@@ -410,19 +443,6 @@ def main():
     job_queue.run_daily(daily_notification, time=datetime.time(hour=10, minute=0, second=0))
 
     application.run_polling()
-
-async def daily_notification(context: ContextTypes.DEFAULT_TYPE):
-    subscriptions = database.get_all_subscriptions()
-    for user_id, chat_id in subscriptions:
-        photo = await get_random_photo()
-        if photo:
-            image_url = photo.get("urls", {}).get("regular")
-            description = photo.get("description") or photo.get("alt_description") or "Без описания"
-            caption = f"{description}\nАвтор: {photo.get('user', {}).get('name', 'Неизвестно')}"
-            try:
-                await context.bot.send_photo(chat_id=chat_id, photo=image_url, caption=caption)
-            except Exception as e:
-                logger.error(f"Ошибка отправки уведомления пользователю {user_id}: {e}")
 
 if __name__ == '__main__':
     main()
