@@ -10,6 +10,7 @@ from telegram.ext import (
     ConversationHandler,
     ContextTypes,
     filters,
+    JobQueue,  # <-- ОБРАТИТЕ ВНИМАНИЕ: импортируем JobQueue явно
 )
 from config import TELEGRAM_BOT_TOKEN
 from unsplash_client import get_random_photo, search_photos
@@ -17,36 +18,39 @@ import database
 from utils.logger import setup_logger
 import httpx
 import asyncio
-from redis_client import get_cached_search_results, cache_search_results, cache_gallery_state
-from buffer_manager import get_buffered_image, cleanup_buffer
 
-# Состояния для диалога и галереи
+# Если используете Redis и локальный буфер:
+# from redis_client import get_cached_search_results, cache_search_results, cache_gallery_state
+# from buffer_manager import get_buffered_image, cleanup_buffer
+
+# ------ Состояния ConversationHandler ------
 SEARCH = 1
 GALLERY_SEARCH = 2
 GALLERY_NAV = 3
 SETTINGS_MAIN, SET_ORIENTATION, SET_COLOR, SET_ORDER = range(10, 14)
 
-# Глобальные переменные
-LAST_PHOTO = {}         # для скачивания одиночных фото
-RANDOM_CACHE = []       # буфер предзагруженных случайных фото
+# ------ Глобальные переменные ------
+LAST_PHOTO = {}
+RANDOM_CACHE = []
 BUFFER_SIZE = 5
 
-# Дефолтные настройки
 DEFAULT_SETTINGS = {
-    "orientation": "any",  # any, landscape, portrait, squarish
-    "color": "any",        # any, black_and_white, black, white, yellow, orange, red, purple, magenta, green, teal, blue
-    "order_by": "relevant" # relevant, latest
+    "orientation": "any",
+    "color": "any",
+    "order_by": "relevant"
 }
 
 setup_logger()
 logger = logging.getLogger(__name__)
 
-# ----- Хелперы для настроек -----
+# ==================== ФУНКЦИИ НАСТРОЕК ====================
 def orientation_keyboard(current_settings: dict) -> InlineKeyboardMarkup:
     options = ["any", "landscape", "portrait", "squarish"]
     buttons = []
     for option in options:
-        text = option + (" ✅" if current_settings.get("orientation", "any") == option else "")
+        text = option
+        if current_settings.get("orientation", "any") == option:
+            text += " ✅"
         buttons.append([InlineKeyboardButton(text, callback_data=f"set_orientation:{option}")])
     buttons.append([InlineKeyboardButton("Назад", callback_data="settings_back")])
     return InlineKeyboardMarkup(buttons)
@@ -55,7 +59,9 @@ def color_keyboard(current_settings: dict) -> InlineKeyboardMarkup:
     options = ["any", "black_and_white", "black", "white", "yellow", "orange", "red", "purple", "magenta", "green", "teal", "blue"]
     buttons = []
     for option in options:
-        text = option + (" ✅" if current_settings.get("color", "any") == option else "")
+        text = option
+        if current_settings.get("color", "any") == option:
+            text += " ✅"
         buttons.append([InlineKeyboardButton(text, callback_data=f"set_color:{option}")])
     buttons.append([InlineKeyboardButton("Назад", callback_data="settings_back")])
     return InlineKeyboardMarkup(buttons)
@@ -64,16 +70,20 @@ def order_keyboard(current_settings: dict) -> InlineKeyboardMarkup:
     options = ["relevant", "latest"]
     buttons = []
     for option in options:
-        text = option + (" ✅" if current_settings.get("order_by", "relevant") == option else "")
+        text = option
+        if current_settings.get("order_by", "relevant") == option:
+            text += " ✅"
         buttons.append([InlineKeyboardButton(text, callback_data=f"set_order:{option}")])
     buttons.append([InlineKeyboardButton("Назад", callback_data="settings_back")])
     return InlineKeyboardMarkup(buttons)
 
 def settings_menu_keyboard(current_settings: dict) -> InlineKeyboardMarkup:
-    text = f"Ваши настройки:\n" \
-           f"Ориентация: {current_settings.get('orientation', 'any')}\n" \
-           f"Цвет: {current_settings.get('color', 'any')}\n" \
-           f"Сортировка: {current_settings.get('order_by', 'relevant')}"
+    text = (
+        f"Ваши настройки:\n"
+        f"Ориентация: {current_settings.get('orientation', 'any')}\n"
+        f"Цвет: {current_settings.get('color', 'any')}\n"
+        f"Сортировка: {current_settings.get('order_by', 'relevant')}"
+    )
     keyboard = [
         [InlineKeyboardButton("Изменить ориентацию", callback_data="settings_orientation")],
         [InlineKeyboardButton("Изменить цвет", callback_data="settings_color")],
@@ -83,7 +93,7 @@ def settings_menu_keyboard(current_settings: dict) -> InlineKeyboardMarkup:
     ]
     return InlineKeyboardMarkup(keyboard)
 
-# ----- Главное меню -----
+# ==================== ОСНОВНОЕ МЕНЮ ====================
 def create_main_menu(is_subscribed: bool = False) -> InlineKeyboardMarkup:
     subscribe_text = "Отписаться" if is_subscribed else "Подписаться"
     keyboard = [
@@ -94,43 +104,34 @@ def create_main_menu(is_subscribed: bool = False) -> InlineKeyboardMarkup:
     ]
     return InlineKeyboardMarkup(keyboard)
 
-# ----- Буфер предзагрузки для случайных фото -----
+# ==================== РАБОТА С СЛУЧАЙНЫМИ ФОТО ====================
 async def preload_random_photo(extra_params: dict):
     photo = await get_random_photo(**extra_params)
     if photo:
         RANDOM_CACHE.append(photo)
 
-# ----- Команды и обработчики -----
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    is_subscribed = database.check_subscription(user.id)
-    await update.message.reply_text(
-        f"Привет, {user.first_name}!\nЭто бот для фото с Unsplash.\nВыберите опцию:",
-        reply_markup=create_main_menu(is_subscribed)
-    )
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Команды:\n/start, /help, /subscribe, /unsubscribe, /settings, /gallery"
-    )
-
-# ----- Случайное фото -----
 async def random_photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
+    # Загружаем настройки пользователя
     settings = database.get_user_settings(user_id) or DEFAULT_SETTINGS
     extra_params = {}
     if settings.get("orientation", "any") != "any":
         extra_params["orientation"] = settings["orientation"]
     if settings.get("color", "any") != "any":
         extra_params["color"] = settings["color"]
+
+    # Берём фото из буфера или запрашиваем
     if RANDOM_CACHE:
         photo = RANDOM_CACHE.pop(0)
     else:
         photo = await get_random_photo(**extra_params)
+
+    # Предзагрузка следующего
     if len(RANDOM_CACHE) < BUFFER_SIZE:
         context.application.create_task(preload_random_photo(extra_params))
+
     if photo:
         LAST_PHOTO[user_id] = photo
         image_url = photo.get("urls", {}).get("regular")
@@ -170,13 +171,7 @@ async def download_photo_handler(update: Update, context: ContextTypes.DEFAULT_T
         logger.error(f"Ошибка при скачивании фото: {e}")
         await query.message.reply_text("Ошибка при скачивании фото.")
 
-async def back_to_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user = query.from_user
-    is_subscribed = database.check_subscription(user.id)
-    await query.message.reply_text("Главное меню:", reply_markup=create_main_menu(is_subscribed))
-
+# ==================== ПОДПИСКА/ОТПИСКА ====================
 async def toggle_subscription_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -191,12 +186,13 @@ async def toggle_subscription_handler(update: Update, context: ContextTypes.DEFA
     is_subscribed = database.check_subscription(user.id)
     await query.message.reply_text("Главное меню:", reply_markup=create_main_menu(is_subscribed))
 
-# ----- Галерея с кэшированием и буфером -----
+# ==================== ГАЛЕРЕЯ ====================
 async def gallery_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Введите поисковый запрос для галереи:")
     return GALLERY_SEARCH
 
 async def gallery_search_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Пример без Redis (если используете Redis, добавьте логику из redis_client)
     query_text = update.message.text
     user_id = update.effective_user.id
     settings = database.get_user_settings(user_id) or DEFAULT_SETTINGS
@@ -207,17 +203,10 @@ async def gallery_search_handler(update: Update, context: ContextTypes.DEFAULT_T
         extra_params["color"] = settings["color"]
     if settings.get("order_by", "relevant"):
         extra_params["order_by"] = settings["order_by"]
+
     page = 1
-    cached = await get_cached_search_results(query_text, settings, page)
-    if cached:
-        results = cached
-    else:
-        results = await search_photos(query_text, page=page, per_page=10, **extra_params)
-        if results and results.get("results"):
-            await cache_search_results(query_text, settings, page, results)
+    results = await search_photos(query_text, page=page, per_page=10, **extra_params)
     if results and results.get("results"):
-        state = {"query": query_text, "page": page, "total_pages": results.get("total_pages", 1)}
-        await cache_gallery_state(user_id, state)
         context.user_data["gallery_query"] = query_text
         context.user_data["gallery_page"] = page
         context.user_data["gallery_total_pages"] = results.get("total_pages", 1)
@@ -233,16 +222,21 @@ async def send_gallery(chat_id, context: ContextTypes.DEFAULT_TYPE):
     if not results:
         return
     media = []
-    # Для каждой фотографии скачиваем миниатюру в буфер
     for photo in results.get("results", []):
         thumb_url = photo.get("urls", {}).get("small")
         if thumb_url:
-            local_path = await get_buffered_image(thumb_url)
-            if local_path:
-                media.append(InputMediaPhoto(media=local_path))
+            # Если используете локальный буфер:
+            # local_path = await get_buffered_image(thumb_url)
+            # if local_path:
+            #     media.append(InputMediaPhoto(media=local_path))
+            # else:
+            #     pass
+            # Без локального буфера:
+            media.append(InputMediaPhoto(media=thumb_url))
     if media:
         await context.bot.send_media_group(chat_id=chat_id, media=media)
-    # Формируем клавиатуру для выбора и навигации
+
+    # Формируем клавиатуру
     buttons = []
     for i in range(len(results.get("results", []))):
         buttons.append(InlineKeyboardButton(f"{i+1}", callback_data=f"gallery_select:{i}"))
@@ -262,7 +256,6 @@ async def gallery_callback_handler(update: Update, context: ContextTypes.DEFAULT
     await query.answer()
     data = query.data
     user_id = query.from_user.id
-    settings = database.get_user_settings(user_id) or DEFAULT_SETTINGS
     if data.startswith("gallery_select:"):
         index = int(data.split(":")[1])
         results = context.user_data.get("gallery_results")
@@ -280,6 +273,7 @@ async def gallery_callback_handler(update: Update, context: ContextTypes.DEFAULT
         if new_page < 1 or new_page > total:
             return
         query_text = context.user_data.get("gallery_query")
+        settings = database.get_user_settings(user_id) or DEFAULT_SETTINGS
         extra_params = {}
         if settings.get("orientation", "any") != "any":
             extra_params["orientation"] = settings["orientation"]
@@ -287,13 +281,8 @@ async def gallery_callback_handler(update: Update, context: ContextTypes.DEFAULT
             extra_params["color"] = settings["color"]
         if settings.get("order_by", "relevant"):
             extra_params["order_by"] = settings["order_by"]
-        cached = await get_cached_search_results(query_text, settings, new_page)
-        if cached:
-            results = cached
-        else:
-            results = await search_photos(query_text, page=new_page, per_page=10, **extra_params)
-            if results and results.get("results"):
-                await cache_search_results(query_text, settings, new_page, results)
+
+        results = await search_photos(query_text, page=new_page, per_page=10, **extra_params)
         if results and results.get("results"):
             context.user_data["gallery_page"] = new_page
             context.user_data["gallery_results"] = results
@@ -302,7 +291,7 @@ async def gallery_callback_handler(update: Update, context: ContextTypes.DEFAULT
         await query.message.reply_text("Главное меню:", reply_markup=create_main_menu(database.check_subscription(user_id)))
     return GALLERY_NAV
 
-# ----- Настройки -----
+# ==================== НАСТРОЙКИ ====================
 async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     settings = database.get_user_settings(user_id)
@@ -359,7 +348,7 @@ async def settings_callback_handler(update: Update, context: ContextTypes.DEFAUL
 def settings_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return SETTINGS_MAIN
 
-# ----- Ежедневные уведомления -----
+# ==================== ЕЖЕДНЕВНЫЕ УВЕДОМЛЕНИЯ ====================
 async def daily_notification(context: ContextTypes.DEFAULT_TYPE):
     subscriptions = database.get_all_subscriptions()
     for user_id, chat_id in subscriptions:
@@ -373,7 +362,6 @@ async def daily_notification(context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 logger.error(f"Ошибка отправки уведомления пользователю {user_id}: {e}")
 
-# ----- Подписка/отписка -----
 async def subscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat_id = update.effective_chat.id
@@ -385,6 +373,19 @@ async def subscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_subscribed = database.check_subscription(user.id)
     await update.message.reply_text("Главное меню:", reply_markup=create_main_menu(is_subscribed))
 
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Команды:\n/start, /help, /subscribe, /unsubscribe, /settings, /gallery"
+    )
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    is_subscribed = database.check_subscription(user.id)
+    await update.message.reply_text(
+        f"Привет, {user.first_name}!\nЭто бот для фото с Unsplash.\nВыберите опцию:",
+        reply_markup=create_main_menu(is_subscribed)
+    )
+
 async def unsubscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if database.check_subscription(user.id):
@@ -395,12 +396,26 @@ async def unsubscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     is_subscribed = database.check_subscription(user.id)
     await update.message.reply_text("Главное меню:", reply_markup=create_main_menu(is_subscribed))
 
-# ----- Основной запуск -----
+# ==================== ЗАПУСК БОТА (исправляем job_queue=None) ====================
 def main():
+    # Инициализируем БД
     database.init_db()
-    application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
-    # Командные обработчики
+    # 1) ЯВНО создаём JobQueue
+    job_queue = JobQueue()
+
+    # 2) Создаём Application, передаём в него наш job_queue
+    application = (
+        ApplicationBuilder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .job_queue(job_queue)
+        .build()
+    )
+
+    # 3) Привязываем очередь к приложению
+    job_queue.set_application(application)
+
+    # ==================== РЕГИСТРАЦИЯ ОБРАБОТЧИКОВ ====================
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("subscribe", subscribe_command))
@@ -413,9 +428,12 @@ def main():
         entry_points=[CommandHandler("gallery", gallery_command)],
         states={
             GALLERY_SEARCH: [MessageHandler(filters.TEXT & ~filters.COMMAND, gallery_search_handler)],
-            GALLERY_NAV: [CallbackQueryHandler(gallery_callback_handler, pattern="^(gallery_select:.*|gallery_next|gallery_prev|back_to_menu)$")]
+            GALLERY_NAV: [
+                CallbackQueryHandler(gallery_callback_handler, pattern="^(gallery_select:.*|gallery_next|gallery_prev|back_to_menu)$")
+            ]
         },
-        fallbacks=[CommandHandler("cancel", lambda u, c: u.message.reply_text("Операция отменена.", reply_markup=create_main_menu()))]
+        fallbacks=[CommandHandler("cancel", lambda u, c: u.message.reply_text("Операция отменена.", reply_markup=create_main_menu()))],
+        # per_message=False по умолчанию – предупреждение можно игнорировать, если бот работает
     )
     application.add_handler(gallery_conv)
 
@@ -423,25 +441,36 @@ def main():
     settings_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(settings_callback_handler, pattern="^(settings_.*|set_.*|reset_settings)$")],
         states={
-            SET_ORIENTATION: [CallbackQueryHandler(settings_callback_handler, pattern="^(set_orientation:.*|settings_back)$")],
-            SET_COLOR: [CallbackQueryHandler(settings_callback_handler, pattern="^(set_color:.*|settings_back)$")],
-            SET_ORDER: [CallbackQueryHandler(settings_callback_handler, pattern="^(set_order:.*|settings_back)$")],
-            SETTINGS_MAIN: [CallbackQueryHandler(settings_callback_handler, pattern="^(settings_.*|reset_settings)$")]
+            SET_ORIENTATION: [
+                CallbackQueryHandler(settings_callback_handler, pattern="^(set_orientation:.*|settings_back)$")
+            ],
+            SET_COLOR: [
+                CallbackQueryHandler(settings_callback_handler, pattern="^(set_color:.*|settings_back)$")
+            ],
+            SET_ORDER: [
+                CallbackQueryHandler(settings_callback_handler, pattern="^(set_order:.*|settings_back)$")
+            ],
+            SETTINGS_MAIN: [
+                CallbackQueryHandler(settings_callback_handler, pattern="^(settings_.*|reset_settings)$")
+            ],
         },
-        fallbacks=[CommandHandler("cancel", lambda u, c: u.message.reply_text("Операция отменена.", reply_markup=create_main_menu()))]
+        fallbacks=[CommandHandler("cancel", lambda u, c: u.message.reply_text("Операция отменена.", reply_markup=create_main_menu()))],
     )
     application.add_handler(settings_conv)
 
-    # Inline-обработчики для одиночных фото
+    # Inline-обработчики
     application.add_handler(CallbackQueryHandler(random_photo_handler, pattern="^random_photo$"))
-    application.add_handler(CallbackQueryHandler(back_to_menu_handler, pattern="^back_to_menu$"))
-    application.add_handler(CallbackQueryHandler(toggle_subscription_handler, pattern="^toggle_subscription$"))
     application.add_handler(CallbackQueryHandler(download_photo_handler, pattern="^download_photo$"))
+    application.add_handler(CallbackQueryHandler(toggle_subscription_handler, pattern="^toggle_subscription$"))
+    application.add_handler(CallbackQueryHandler(lambda u, c: u.answer(), pattern="^back_to_menu$"))
 
-    # Ежедневные уведомления (10:00)
-    job_queue = application.job_queue
-    job_queue.run_daily(daily_notification, time=datetime.time(hour=10, minute=0, second=0))
+    # 4) Планируем ежедневные уведомления
+    job_queue.run_daily(
+        daily_notification,
+        time=datetime.time(hour=10, minute=0, second=0)
+    )
 
+    # 5) Запуск бота
     application.run_polling()
 
 if __name__ == '__main__':
